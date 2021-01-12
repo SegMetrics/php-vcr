@@ -24,6 +24,29 @@ class Yaml extends AbstractStorage
     protected $yamlDumper;
 
     /**
+     * Array of Request MD5 Hashes and the byte to seek to in the file
+     * This improves our lookup speed
+     *      key => [
+     *              request -> the full request
+     *              byte_pos -> the position in the file that this request starts on
+     *              ]
+     * @var array
+     */
+    private $recordingLookupArray = null;
+
+    /**
+     * The beginning of the line we should start reading from next
+     * @var null
+     */
+    private $latestBytePosition = null;
+
+    /**
+     * Cache for the current index of the recordingLookupArray
+     * @var int
+     */
+    private $latestKeyPosition = 0;
+
+    /**
      * Creates a new YAML based file store.
      *
      * @param string $cassettePath path to the cassette directory
@@ -47,6 +70,23 @@ class Yaml extends AbstractStorage
         fseek($this->handle, -1, SEEK_END);
         fwrite($this->handle, "\n".$this->yamlDumper->dump([$recording], 4));
         fflush($this->handle);
+
+        // Every time we write, we need to reset the lookup array
+        $this->resetLookupCache();
+    }
+
+    /**
+     * Returns the current record.
+     *
+     * @return array<string,mixed>|null parsed current record
+     */
+    public function current()
+    {
+        if(empty( $this->recordingLookupArray[ $this->position ] )){ return []; }
+
+        $recording = $this->yamlParser->parse($this->readNextRecord( $this->recordingLookupArray[ $this->position ]['byte_pos'] ));
+
+        return empty($recording[0]) ? null : $recording[0];
     }
 
     /**
@@ -56,17 +96,36 @@ class Yaml extends AbstractStorage
      */
     public function next()
     {
-        $recording = $this->yamlParser->parse($this->readNextRecord());
-        $this->current = $recording[0] ?? null;
-        ++$this->position;
+        $this->latestKeyPosition = ++$this->position;
+    }
+
+    /**
+     * Generates our lookup table if we don't have one already
+     */
+    private function generateLookupTable()
+    {
+        $this->resetLookupCache();
+
+        while (true) {
+            $recording = $this->yamlParser->parse($this->readNextRecord());
+            if(empty($recording[0])){ break; }
+
+            $this->recordingLookupArray[] = [
+                'request'  => $recording[0]['request'] ?? null,
+                'byte_pos' => $this->latestBytePosition ?? 0,
+            ];
+            $this->latestBytePosition = null;
+        }
+        $this->resetFilePosition();
     }
 
     /**
      * Returns the next record in raw format.
      *
+     * @param int $startByte
      * @return string next record in raw format
      */
-    private function readNextRecord(): string
+    private function readNextRecord( $startByte = 0): string
     {
         if ($this->isEOF) {
             $this->isValidPosition = false;
@@ -74,6 +133,10 @@ class Yaml extends AbstractStorage
 
         $isInRecord = false;
         $recording = '';
+
+        if($startByte !== 0){
+            fseek($this->handle, $startByte, SEEK_SET);
+        }
 
         while (false !== ($line = fgets($this->handle))) {
             $isNewArrayStart = 0 === strpos($line, '-');
@@ -85,6 +148,9 @@ class Yaml extends AbstractStorage
 
             if (!$isInRecord && $isNewArrayStart) {
                 $isInRecord = true;
+
+                // Set the latest Byte Position to be the beginning of the line
+                $this->latestBytePosition = ftell($this->handle) - strlen($line);
             }
 
             if ($isInRecord) {
@@ -106,10 +172,27 @@ class Yaml extends AbstractStorage
      */
     public function rewind()
     {
+        $this->resetFilePosition();
+        $this->position = $this->latestKeyPosition;
+    }
+
+    /**
+     * Set the file storage to the beginning
+     */
+    private function resetFilePosition()
+    {
         rewind($this->handle);
         $this->isEOF = false;
         $this->isValidPosition = true;
-        $this->position = 0;
+    }
+
+    /**
+     * Restart the lookup cache
+     */
+    private function resetLookupCache()
+    {
+        $this->recordingLookupArray = null;
+        $this->latestBytePosition = null;
     }
 
     /**
@@ -119,10 +202,11 @@ class Yaml extends AbstractStorage
      */
     public function valid()
     {
-        if (null === $this->current) {
-            $this->next();
+        // Generate our lookup array if it doesn't exist
+        if($this->recordingLookupArray === null){
+            $this->generateLookupTable();
         }
 
-        return null !== $this->current && $this->isValidPosition;
+        return isset( $this->recordingLookupArray[ $this->position ] );
     }
 }
